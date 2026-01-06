@@ -1,0 +1,6 @@
+@back_bd_HostAddress = http://localhost:5196
+
+GET {{back_bd_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
