@@ -1,11 +1,11 @@
-using Microsoft.AspNetCore.Mvc;
-using back_bd.Entidades;
-using Microsoft.AspNetCore.OutputCaching;
+ï»¿using AutoMapper;
 using back_bd.DTO_s;
-using AutoMapper;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.OutputCaching;
+using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.AspNetCore.Authorization;
-
+using System.Data;
+using back_bd.Entidades;
 namespace back_bd.Controllers
 {
     [Route("api/[controller]")]
@@ -69,10 +69,16 @@ namespace back_bd.Controllers
             }
 
             var episodios = await appDBContext.Episodios
-                .Include(e => e.Anime)
-                .Where(e => e.AnimeId == animeId && e.IsActive)
-                .OrderBy(e => e.Numero)
+                .FromSqlRaw("EXEC sp_ObtenerEpisodiosPorAnime @AnimeId = {0}", animeId)
                 .ToListAsync();
+            episodios = episodios.OrderBy(e => e.Numero).ToList();
+
+            foreach (var episodio in episodios)
+            {
+                await appDBContext.Entry(episodio)
+                    .Reference(e => e.Anime)
+                    .LoadAsync();
+            }
 
             return Ok(mapper.Map<List<EpisodioReadDTO>>(episodios));
         }
@@ -81,38 +87,42 @@ namespace back_bd.Controllers
         [HttpPost]
         public async Task<IActionResult> Post([FromBody] EpisodioCreateDTO episodioDTO)
         {
-            // Verificar que el anime existe
-            var animeExists = await appDBContext.Animes.AnyAsync(a => a._id == episodioDTO.AnimeId);
-            if (!animeExists)
+            try
             {
-                return BadRequest(new { message = "El anime especificado no existe" });
+                var parametroId = new SqlParameter("@EpisodioId", SqlDbType.Int) { Direction = ParameterDirection.Output };
+
+                var parameters = new[]
+                {
+                new SqlParameter("@Numero", episodioDTO.Numero),
+                new SqlParameter("@Titulo", episodioDTO.Titulo),
+                new SqlParameter("@Descripcion", episodioDTO.Descripcion ?? (object)DBNull.Value),
+                new SqlParameter("@VideoUrl", episodioDTO.VideoUrl),
+                new SqlParameter("@Duracion", episodioDTO.Duracion),
+                new SqlParameter("@AnimeId", episodioDTO.AnimeId),
+                parametroId
+                };
+
+                await appDBContext.Database.ExecuteSqlRawAsync(
+                    "EXEC sp_InsertarEpisodio @Numero, @Titulo, @Descripcion, @VideoUrl, @Duracion, @AnimeId, @EpisodioId OUTPUT",
+                    parameters
+                );
+
+                var episodioId = (int)parametroId.Value;
+
+                await outputCacheStore.EvictByTagAsync(cacheTag, default);
+
+                var episodioCreado = await appDBContext.Episodios
+                    .Include(e => e.Anime)
+                    .FirstOrDefaultAsync(e => e._id == episodioId);
+
+                var episodioResponse = mapper.Map<EpisodioReadDTO>(episodioCreado);
+
+                return CreatedAtRoute("ObtenerEpisodioPorId", new { _id = episodioId }, episodioResponse);
             }
-
-            // Verificar que no exista un episodio con el mismo número para ese anime
-            var episodioExistente = await appDBContext.Episodios
-                .AnyAsync(e => e.AnimeId == episodioDTO.AnimeId && e.Numero == episodioDTO.Numero);
-
-            if (episodioExistente)
+            catch (SqlException ex)
             {
-                return BadRequest(new { message = $"Ya existe un episodio número {episodioDTO.Numero} para este anime" });
+                return BadRequest(new { message = ex.Message });
             }
-
-            var episodio = mapper.Map<Episodios>(episodioDTO);
-            episodio._id = 0;
-            episodio.FechaRegistro = DateTime.UtcNow;
-
-            appDBContext.Add(episodio);
-            await appDBContext.SaveChangesAsync();
-            await outputCacheStore.EvictByTagAsync(cacheTag, default);
-
-            // Cargar la relación para el DTO
-            var episodioCreado = await appDBContext.Episodios
-                .Include(e => e.Anime)
-                .FirstOrDefaultAsync(e => e._id == episodio._id);
-
-            var episodioResponse = mapper.Map<EpisodioReadDTO>(episodioCreado);
-
-            return CreatedAtRoute("ObtenerEpisodioPorId", new { _id = episodio._id }, episodioResponse);
         }
 
         // PUT: api/Episodios/5
@@ -132,7 +142,7 @@ namespace back_bd.Controllers
                 return BadRequest(new { message = "El anime especificado no existe" });
             }
 
-            // Verificar que no exista otro episodio con el mismo número para ese anime
+            // Verificar que no exista otro episodio con el mismo nÃºmero para ese anime
             var duplicado = await appDBContext.Episodios
                 .AnyAsync(e => e.AnimeId == episodioDTO.AnimeId 
                             && e.Numero == episodioDTO.Numero 
@@ -140,7 +150,7 @@ namespace back_bd.Controllers
 
             if (duplicado)
             {
-                return BadRequest(new { message = $"Ya existe otro episodio número {episodioDTO.Numero} para este anime" });
+                return BadRequest(new { message = $"Ya existe otro episodio nÃºmero {episodioDTO.Numero} para este anime" });
             }
 
             mapper.Map(episodioDTO, episodio);
@@ -154,40 +164,44 @@ namespace back_bd.Controllers
 
         // PATCH: api/Episodios/5/toggle-status
         [HttpPatch("{_id:int}/toggle-status")]
-        [Authorize(Roles = "ROOT,ADMIN")]
         public async Task<IActionResult> ToggleStatus(int _id)
         {
-            var episodio = await appDBContext.Episodios.FindAsync(_id);
-            if (episodio == null)
+            try
             {
-                return NotFound(new { message = "Episodio no encontrado" });
+                var parameter = new SqlParameter("@EpisodioId", _id);
+
+                await appDBContext.Database.ExecuteSqlRawAsync(
+                    "EXEC sp_DesactivarEpisodio @EpisodioId",
+                    parameter
+                );
+
+                // Limpiar cachÃ© del servidor
+                await outputCacheStore.EvictByTagAsync(cacheTag, default);
+                
+                // Limpiar tracking de EF
+                appDBContext.ChangeTracker.Clear();
+
+                // Consultar estado actualizado
+                var episodio = await appDBContext.Episodios
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(e => e._id == _id);
+
+                if (episodio == null)
+                {
+                    return NotFound(new { message = "Episodio no encontrado" });
+                }
+
+                // Agregar headers para evitar cachÃ© del navegador
+                Response.Headers.Append("Cache-Control", "no-cache, no-store, must-revalidate");
+                Response.Headers.Append("Pragma", "no-cache");
+                Response.Headers.Append("Expires", "0");
+
+                return Ok(new { _id = episodio._id, isActive = episodio.IsActive });
             }
-
-            episodio.IsActive = !episodio.IsActive;
-            episodio.FechaModificacion = DateTime.UtcNow;
-
-            await appDBContext.SaveChangesAsync();
-            await outputCacheStore.EvictByTagAsync(cacheTag, default);
-
-            return Ok(new { _id = episodio._id, isActive = episodio.IsActive });
-        }
-
-        // DELETE: api/Episodios/5
-        [HttpDelete("{_id:int}")]
-        [Authorize(Roles = "ROOT")]
-        public async Task<IActionResult> Delete(int _id)
-        {
-            var episodio = await appDBContext.Episodios.FindAsync(_id);
-            if (episodio == null)
+            catch (SqlException ex)
             {
-                return NotFound(new { message = "Episodio no encontrado" });
+                return BadRequest(new { message = ex.Message });
             }
-
-            appDBContext.Episodios.Remove(episodio);
-            await appDBContext.SaveChangesAsync();
-            await outputCacheStore.EvictByTagAsync(cacheTag, default);
-
-            return NoContent();
         }
     }
 }

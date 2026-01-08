@@ -32,7 +32,11 @@ namespace back_bd.Controllers
         [OutputCache(Tags = [cacheTag])]
         public async Task<List<AnimeReadDTO>> Get()
         {
+
             var animes = await appDBContext.Animes
+                .FromSqlRaw(@"
+            SELECT a.* 
+            FROM Animes a")
                 .Include(a => a.Estudio)
                 .Include(a => a.AnimeGeneros)
                     .ThenInclude(ag => ag.Genero)
@@ -71,7 +75,6 @@ namespace back_bd.Controllers
             var anime = mapper.Map<Anime>(animeDTO);
             anime._id = 0;
 
-            // Subir imagen a Azure si existe
             if (animeDTO.Imagen != null)
             {
                 anime.ImagenUrl = await saveFiles.SaveFile(containerName, animeDTO.Imagen);
@@ -80,7 +83,6 @@ namespace back_bd.Controllers
             appDBContext.Add(anime);
             await appDBContext.SaveChangesAsync();
 
-            // Agregar los géneros usando la tabla intermedia
             if (animeDTO.GenerosIds != null && animeDTO.GenerosIds.Any())
             {
                 foreach (var generoId in animeDTO.GenerosIds)
@@ -96,7 +98,6 @@ namespace back_bd.Controllers
 
             await outputCacheStore.EvictByTagAsync(cacheTag, default);
 
-            // Cargar las relaciones para el DTO
             var animeCreado = await appDBContext.Animes
                 .Include(a => a.Estudio)
                 .Include(a => a.AnimeGeneros)
@@ -133,7 +134,6 @@ namespace back_bd.Controllers
 
             var imagenAnterior = anime.ImagenUrl;
 
-            // Actualizar propiedades del anime
             anime.Titulo = animeDTO.Titulo;
             anime.Sinopsis = animeDTO.Sinopsis;
             anime.FechaEstreno = animeDTO.FechaEstreno;
@@ -146,21 +146,18 @@ namespace back_bd.Controllers
 
             // === ACTUALIZAR GÉNEROS ===
             Console.WriteLine($"Eliminando géneros del anime {_id} usando SQL directo...");
-            
-            // Usar SQL directo para evitar problemas de rastreo
+
             await appDBContext.Database.ExecuteSqlRawAsync(
                 "DELETE FROM [AnimeGeneros] WHERE [AnimeId] = {0}", _id);
-            
-            Console.WriteLine("Géneros eliminados correctamente");
 
-            // Agregar las nuevas relaciones
+            Console.WriteLine("Géneros eliminados correctamente");
             if (animeDTO.GenerosIds != null && animeDTO.GenerosIds.Any())
             {
                 Console.WriteLine($"Agregando {animeDTO.GenerosIds.Count} nuevos géneros al anime {_id}...");
                 
                 foreach (var generoId in animeDTO.GenerosIds)
                 {
-                    // Crear instancias completamente nuevas sin rastreo previo
+
                     var nuevaRelacion = new AnimeGeneros
                     {
                         AnimeId = _id,
@@ -205,23 +202,6 @@ namespace back_bd.Controllers
             await outputCacheStore.EvictByTagAsync(cacheTag, default);
             await appDBContext.Entry(anime).ReloadAsync();
             return Ok(new { _id = anime._id, isActive = anime.IsActive });
-        }
-
-        [HttpDelete("{_id:int}")]
-        public async Task<IActionResult> Delete(int _id)
-        {
-            var anime = await appDBContext.Animes.FindAsync(_id);
-            if (anime == null)
-            {
-                return NotFound();
-            }
-
-            // Eliminar imagen de Azure
-            await saveFiles.DeleteFile(containerName, anime.ImagenUrl);
-
-            await appDBContext.Animes.Where(x => x._id == _id).ExecuteDeleteAsync();
-            await outputCacheStore.EvictByTagAsync(cacheTag, default);
-            return NoContent();
         }
     }
 }
